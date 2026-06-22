@@ -1,0 +1,23 @@
+{
+  "name": "playmcp-server",
+  "version": "1.0.0",
+  "description": "PlayMCP remote server using SSE",
+  "main": "build/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node build/index.js",
+    "dev": "tsc-watch --onSuccess \"node build/index.js\""
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.1",
+    "cors": "^2.8.5",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.2",
+    "tsc-watch": "^6.2.1",
+    "typescript": "^5.7.2"
+  }
+}
