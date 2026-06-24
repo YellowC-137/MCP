@@ -30,6 +30,39 @@ async function kakaoGet(path, params) {
     const data = (await res.json());
     return data.documents ?? [];
 }
+// 문자열 배열 인자 정규화.
+// LLM/클라이언트가 배열 대신 JSON 문자열('["a","b"]')이나 콤마 문자열('a, b')로 보내는 흔한 실수를 흡수.
+function normalizeStringArray(input) {
+    if (Array.isArray(input)) {
+        // 배열인데 원소가 JSON 배열 문자열인 경우(예: ['["카페","조용한"]'])도 펼친다.
+        return input.flatMap((item) => normalizeStringArray(item));
+    }
+    if (typeof input === 'string') {
+        const trimmed = input.trim();
+        if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+            try {
+                const parsed = JSON.parse(trimmed);
+                if (Array.isArray(parsed))
+                    return parsed.map((v) => String(v).trim()).filter(Boolean);
+            }
+            catch {
+                // JSON 파싱 실패 시 콤마 분리로 폴백
+            }
+        }
+        return trimmed
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean);
+    }
+    return [];
+}
+// 위경도 같은 숫자 인자 정규화 (문자열 "37.5"도 허용, 0/NaN은 무효 처리).
+function toCoord(input) {
+    const n = typeof input === 'string' ? parseFloat(input) : input;
+    if (typeof n !== 'number' || Number.isNaN(n) || n === 0)
+        return null;
+    return n;
+}
 // 장소/주소 문자열 → 좌표 (키워드 검색 첫 결과)
 async function geocode(query) {
     const docs = await kakaoGet('/search/keyword.json', { query, size: 1 });
@@ -53,7 +86,7 @@ server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => {
         tools: [
             {
                 name: 'calculate_optimal_midpoint',
-                description: '여러 모임 멤버들의 출발지 목록을 받아서 최적의 중간 대중교통 거점 위치를 계산해 반환합니다.',
+                description: '여러 모임 멤버들의 출발지 목록을 받아서 최적의 중간 대중교통 거점 위치를 계산해 반환합니다. 장소 검색(search_kakao_places) 전에 가장 먼저 호출해 중간 거점을 파악하세요.',
                 inputSchema: {
                     type: 'object',
                     properties: {
@@ -70,7 +103,7 @@ server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => {
             },
             {
                 name: 'search_kakao_places',
-                description: '좌표 정보(위도, 경도)와 뾰족해진 취향 키워드를 바탕으로 카카오맵의 장소 목록을 검색해 상위 3곳의 정보를 반환합니다.',
+                description: '좌표 정보(위도, 경도)와 뾰족해진 취향 키워드를 바탕으로 카카오맵의 장소 목록을 검색해 상위 3곳의 정보를 반환합니다. 호출 전에 사용자에게 추가 조건(주종/룸/예산/분위기 등)을 1~2가지 되물어 키워드를 구체화한 뒤 호출하세요.',
                 inputSchema: {
                     type: 'object',
                     properties: {
@@ -105,9 +138,9 @@ server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => {
 server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
     if (name === 'calculate_optimal_midpoint') {
-        const locations = args?.locations ?? [];
-        if (!Array.isArray(locations) || locations.length === 0) {
-            throw new Error('locations 배열 필수. 최소 1개 출발지 필요.');
+        const locations = normalizeStringArray(args?.locations);
+        if (locations.length === 0) {
+            throw new Error('locations 배열 필수. 최소 1개 출발지 필요. (예: ["강남역","홍대입구역"])');
         }
         console.log(`중간 지점 계산 요청. 입력 출발지:`, locations);
         // 1. 각 출발지 좌표 변환
@@ -152,15 +185,15 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
         };
     }
     if (name === 'search_kakao_places') {
-        const lat = args?.lat;
-        const lng = args?.lng;
-        const keywords = args?.keywords;
-        const radius = args?.radius || 1000;
-        if (typeof lat !== 'number' || typeof lng !== 'number') {
-            throw new Error('lat, lng 숫자 필수.');
+        const lat = toCoord(args?.lat);
+        const lng = toCoord(args?.lng);
+        const keywords = normalizeStringArray(args?.keywords);
+        const radius = toCoord(args?.radius) ?? 1000;
+        if (lat === null || lng === null) {
+            throw new Error('lat, lng 유효 좌표 필수. calculate_optimal_midpoint의 center_lat/center_lng 값을 그대로 넣으세요.');
         }
-        if (!Array.isArray(keywords) || keywords.length === 0) {
-            throw new Error('keywords 배열 필수.');
+        if (keywords.length === 0) {
+            throw new Error('keywords 배열 필수. (예: ["카페","조용한"])');
         }
         console.log(`카카오 장소 검색 요청. 좌표: (${lat}, ${lng}), 키워드:`, keywords, `반경: ${radius}m`);
         const safeRadius = Math.min(radius, 20000); // 카카오 최대 20000m
