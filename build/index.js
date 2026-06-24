@@ -11,6 +11,9 @@ const express_1 = __importDefault(require("express"));
 const cors_1 = __importDefault(require("cors"));
 const KAKAO_REST_API_KEY = process.env.KAKAO_REST_API_KEY;
 const KAKAO_BASE = 'https://dapi.kakao.com/v2/local';
+// Google Places (별점 보조 소스). 키 없으면 보강 단계 자동 스킵 → 카카오 결과만으로 동작.
+const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY;
+const GOOGLE_PLACES_SEARCH = 'https://places.googleapis.com/v1/places:searchText';
 // 카카오 로컬 API 호출 공통 함수
 async function kakaoGet(path, params) {
     if (!KAKAO_REST_API_KEY) {
@@ -69,6 +72,49 @@ async function geocode(query) {
     if (docs.length === 0)
         return null;
     return { lat: parseFloat(docs[0].y), lng: parseFloat(docs[0].x) };
+}
+// 카카오 장소를 Google Places로 매칭해 별점/리뷰수/가격대를 가져온다.
+// 실패(키 없음/쿼터/매칭 실패)하면 null을 반환해 호출부가 별점 없이 진행하도록 한다 (안정성 우선).
+async function fetchGoogleRating(name, lat, lng) {
+    if (!GOOGLE_PLACES_API_KEY)
+        return null;
+    try {
+        const res = await fetch(GOOGLE_PLACES_SEARCH, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Goog-Api-Key': GOOGLE_PLACES_API_KEY,
+                // 필드마스크로 필요한 필드만 요청 → 비용 절감.
+                'X-Goog-FieldMask': 'places.displayName,places.rating,places.userRatingCount,places.priceLevel',
+            },
+            body: JSON.stringify({
+                textQuery: name,
+                languageCode: 'ko',
+                regionCode: 'KR',
+                maxResultCount: 1,
+                locationBias: {
+                    circle: { center: { latitude: lat, longitude: lng }, radius: 500.0 },
+                },
+            }),
+        });
+        if (!res.ok) {
+            console.error(`Google Places 오류 ${res.status}: ${await res.text()}`);
+            return null;
+        }
+        const data = (await res.json());
+        const p = data.places?.[0];
+        if (!p)
+            return null;
+        return {
+            rating: p.rating ?? null,
+            user_rating_count: p.userRatingCount ?? null,
+            price_level: p.priceLevel ?? null,
+        };
+    }
+    catch (e) {
+        console.error('Google Places 호출 실패:', e);
+        return null;
+    }
 }
 const app = (0, express_1.default)();
 app.use((0, cors_1.default)());
@@ -220,19 +266,42 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
                 }
             }
         }
-        // 매칭 키워드 수 내림차순 → 거리 오름차순
+        // 1차 정렬: 매칭 키워드 수 내림차순 → 거리 오름차순
         const ranked = [...scoreMap.values()].sort((a, b) => {
             if (b.matched.size !== a.matched.size)
                 return b.matched.size - a.matched.size;
             return a.distance - b.distance;
         });
-        const places = ranked.slice(0, 3).map((s) => ({
+        // 별점 보강 대상: 1차 상위 후보 8곳만 Google 조회(비용/지연 절감). 나머지는 별점 없이 후순위.
+        const TOP_CANDIDATES = 8;
+        const candidates = ranked.slice(0, TOP_CANDIDATES);
+        const ratings = await Promise.all(candidates.map((s) => {
+            const lat2 = parseFloat(s.doc.y);
+            const lng2 = parseFloat(s.doc.x);
+            return fetchGoogleRating(s.doc.place_name, lat2, lng2);
+        }));
+        // 종합 스코어 = 매칭(0.45) + 별점(0.40, 리뷰수로 신뢰 가중) + 근접(0.15)
+        const scored = candidates.map((s, i) => {
+            const r = ratings[i];
+            const matchNorm = s.matched.size / keywords.length;
+            const ratingNorm = r?.rating ? r.rating / 5 : 0;
+            // 리뷰수 적으면 별점 신뢰 낮춤 (50건에서 포화)
+            const confidence = r?.user_rating_count ? Math.min(r.user_rating_count / 50, 1) : 0;
+            const proximity = s.distance === Number.MAX_SAFE_INTEGER ? 0 : 1 - Math.min(s.distance / safeRadius, 1);
+            const score = 0.45 * matchNorm + 0.4 * (ratingNorm * confidence) + 0.15 * proximity;
+            return { s, r, score };
+        });
+        scored.sort((a, b) => b.score - a.score);
+        const places = scored.slice(0, 3).map(({ s, r }) => ({
             place_name: s.doc.place_name,
             address_name: s.doc.road_address_name || s.doc.address_name,
             category_name: s.doc.category_name,
             place_url: s.doc.place_url,
             distance_m: s.distance === Number.MAX_SAFE_INTEGER ? null : s.distance,
             matched_keywords: [...s.matched],
+            rating: r?.rating ?? null,
+            user_rating_count: r?.user_rating_count ?? null,
+            price_level: r?.price_level ?? null,
         }));
         return {
             content: [{ type: 'text', text: JSON.stringify(places) }],
