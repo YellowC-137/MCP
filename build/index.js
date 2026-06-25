@@ -14,6 +14,7 @@ const KAKAO_BASE = 'https://dapi.kakao.com/v2/local';
 // Google Places (별점 보조 소스). 키 없으면 보강 단계 자동 스킵 → 카카오 결과만으로 동작.
 const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY;
 const GOOGLE_PLACES_SEARCH = 'https://places.googleapis.com/v1/places:searchText';
+const GOOGLE_TIMEOUT_MS = 3000; // 개별 Google 호출 타임아웃
 // 카카오 로컬 API 호출 공통 함수
 async function kakaoGet(path, params) {
     if (!KAKAO_REST_API_KEY) {
@@ -134,9 +135,13 @@ async function geocode(query) {
 async function fetchGoogleRating(name, lat, lng) {
     if (!GOOGLE_PLACES_API_KEY)
         return null;
+    // 개별 호출 타임아웃. 한 곳이 느려도 전체 응답을 막지 않게 (안정성).
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), GOOGLE_TIMEOUT_MS);
     try {
         const res = await fetch(GOOGLE_PLACES_SEARCH, {
             method: 'POST',
+            signal: controller.signal,
             headers: {
                 'Content-Type': 'application/json',
                 'X-Goog-Api-Key': GOOGLE_PLACES_API_KEY,
@@ -170,6 +175,9 @@ async function fetchGoogleRating(name, lat, lng) {
     catch (e) {
         console.error('Google Places 호출 실패:', e);
         return null;
+    }
+    finally {
+        clearTimeout(timer);
     }
 }
 // MCP 서버 인스턴스 생성 + 핸들러 등록.
@@ -310,34 +318,48 @@ function createServer() {
             console.log(`카카오 장소 검색 요청. 좌표: (${lat}, ${lng}), 원키워드:`, rawKeywords, `확장:`, keywords, `반경: ${radius}m`, `카테고리: ${categoryCode ?? '없음'}`);
             const safeRadius = Math.min(radius, 20000); // 카카오 최대 20000m
             const scoreMap = new Map();
-            const perKeyword = await Promise.all(keywords.map((kw) => {
-                const params = {
-                    query: kw,
-                    x: lng,
-                    y: lat,
-                    radius: safeRadius,
-                    sort: 'distance',
-                    size: 15,
-                };
-                // 카테고리 추론/지정 시 해당 업종(CE7/FD6)으로 제한해 무관 장소 제거.
-                if (categoryCode)
-                    params.category_group_code = categoryCode;
-                return kakaoGet('/search/keyword.json', params).then((docs) => ({ kw, docs }));
-            }));
-            for (const { kw, docs } of perKeyword) {
-                for (const d of docs) {
-                    const id = d.place_url || d.place_name;
-                    const dist = d.distance ? parseInt(d.distance, 10) : Number.MAX_SAFE_INTEGER;
-                    const existing = scoreMap.get(id);
-                    if (existing) {
-                        existing.matched.add(kw);
-                        existing.distance = Math.min(existing.distance, dist);
-                    }
-                    else {
-                        scoreMap.set(id, { doc: d, matched: new Set([kw]), distance: dist });
+            // 주어진 반경으로 키워드별 검색 후 scoreMap에 병합.
+            const searchAtRadius = async (r) => {
+                const perKeyword = await Promise.all(keywords.map((kw) => {
+                    const params = {
+                        query: kw,
+                        x: lng,
+                        y: lat,
+                        radius: r,
+                        sort: 'distance',
+                        size: 15,
+                    };
+                    // 카테고리 추론/지정 시 해당 업종(CE7/FD6)으로 제한해 무관 장소 제거.
+                    if (categoryCode)
+                        params.category_group_code = categoryCode;
+                    return kakaoGet('/search/keyword.json', params).then((docs) => ({ kw, docs }));
+                }));
+                for (const { kw, docs } of perKeyword) {
+                    for (const d of docs) {
+                        const id = d.place_url || d.place_name;
+                        const dist = d.distance ? parseInt(d.distance, 10) : Number.MAX_SAFE_INTEGER;
+                        const existing = scoreMap.get(id);
+                        if (existing) {
+                            existing.matched.add(kw);
+                            existing.distance = Math.min(existing.distance, dist);
+                        }
+                        else {
+                            scoreMap.set(id, { doc: d, matched: new Set([kw]), distance: dist });
+                        }
                     }
                 }
+            };
+            // 0건이면 반경 단계 확대 재검색(×2, ×4 … 최대 20km) → 무인 운영 중 빈 응답 방지.
+            let curRadius = safeRadius;
+            await searchAtRadius(curRadius);
+            while (scoreMap.size === 0 && curRadius < 20000) {
+                curRadius = Math.min(curRadius * 2, 20000);
+                console.log(`결과 0건 → 반경 확대 재검색: ${curRadius}m`);
+                await searchAtRadius(curRadius);
+                if (curRadius >= 20000)
+                    break;
             }
+            const effectiveRadius = curRadius;
             // 1차 정렬: 매칭 키워드 수 내림차순 → 거리 오름차순
             const ranked = [...scoreMap.values()].sort((a, b) => {
                 if (b.matched.size !== a.matched.size)
@@ -347,11 +369,13 @@ function createServer() {
             // 별점 보강 대상: 1차 상위 후보 8곳만 Google 조회(비용/지연 절감). 나머지는 별점 없이 후순위.
             const TOP_CANDIDATES = 8;
             const candidates = ranked.slice(0, TOP_CANDIDATES);
-            const ratings = await Promise.all(candidates.map((s) => {
+            // allSettled로 한 곳 실패/타임아웃이 배치 전체를 깨지 않게. rejected는 별점 없음(null)으로 폴백.
+            const settled = await Promise.allSettled(candidates.map((s) => {
                 const lat2 = parseFloat(s.doc.y);
                 const lng2 = parseFloat(s.doc.x);
                 return fetchGoogleRating(s.doc.place_name, lat2, lng2);
             }));
+            const ratings = settled.map((r) => (r.status === 'fulfilled' ? r.value : null));
             // 종합 스코어 = 매칭(0.45) + 별점(0.40, 리뷰수로 신뢰 가중) + 근접(0.15)
             const scored = candidates.map((s, i) => {
                 const r = ratings[i];
@@ -360,7 +384,7 @@ function createServer() {
                 const ratingNorm = r?.rating ? r.rating / 5 : 0;
                 // 리뷰수 적으면 별점 신뢰 낮춤 (50건에서 포화)
                 const confidence = r?.user_rating_count ? Math.min(r.user_rating_count / 50, 1) : 0;
-                const proximity = s.distance === Number.MAX_SAFE_INTEGER ? 0 : 1 - Math.min(s.distance / safeRadius, 1);
+                const proximity = s.distance === Number.MAX_SAFE_INTEGER ? 0 : 1 - Math.min(s.distance / effectiveRadius, 1);
                 const score = 0.45 * matchNorm + 0.4 * (ratingNorm * confidence) + 0.15 * proximity;
                 return { s, r, score };
             });
