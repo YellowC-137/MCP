@@ -78,6 +78,63 @@ function toCoord(input: unknown): number | null {
   return n;
 }
 
+// 무드/추상 키워드 → 구체 검색어 확장.
+// 사용자가 "조용한","감성" 같은 분위기어만 줄 때 카카오 키워드 매칭률을 높인다.
+// 원 키워드는 항상 유지하고 동의/연관어를 덧붙인다 (중복은 Set으로 제거).
+const MOOD_MAP: Record<string, string[]> = {
+  조용한: ['조용한', '한적한'],
+  한적한: ['한적한', '조용한'],
+  감성: ['감성', '분위기'],
+  분위기: ['분위기', '감성'],
+  데이트: ['데이트', '분위기'],
+  뷰: ['뷰맛집', '루프탑'],
+  루프탑: ['루프탑', '뷰맛집'],
+  가성비: ['가성비'],
+  회식: ['회식', '단체'],
+  단체: ['단체', '회식'],
+  룸: ['룸', '프라이빗'],
+  프라이빗: ['프라이빗', '룸'],
+  모던: ['모던', '깔끔한'],
+  이색: ['이색', '독특한'],
+  노포: ['노포', '맛집'],
+};
+
+function expandKeywords(keywords: string[]): string[] {
+  const out = new Set<string>();
+  for (const kw of keywords) {
+    out.add(kw);
+    const syn = MOOD_MAP[kw];
+    if (syn) syn.forEach((s) => out.add(s));
+  }
+  return [...out];
+}
+
+// 키워드로 카카오 카테고리(CE7 카페 / FD6 음식점) 추론 → 검색을 해당 업종으로 제한해 정확도↑.
+// 카페 힌트를 먼저 검사 (음식점 힌트가 더 광범위해 오분류 방지).
+const CATEGORY_HINTS: Array<{ code: 'CE7' | 'FD6'; hints: string[] }> = [
+  { code: 'CE7', hints: ['카페', '커피', '디저트', '베이커리', '브런치', '빵', '티룸'] },
+  {
+    code: 'FD6',
+    hints: ['맛집', '식당', '밥', '술집', '와인바', '이자카야', '포차', '고기', '파스타', '한식', '일식', '중식', '양식', '횟집', '바', '비스트로', '레스토랑', '맥주', '칵테일'],
+  },
+];
+
+function inferCategory(keywords: string[]): 'CE7' | 'FD6' | null {
+  const joined = keywords.join(' ');
+  for (const { code, hints } of CATEGORY_HINTS) {
+    if (hints.some((h) => joined.includes(h))) return code;
+  }
+  return null;
+}
+
+// 'food'/'cafe' 명시값을 카카오 코드로, 'auto'면 키워드 추론.
+function resolveCategory(explicit: unknown, keywords: string[]): 'CE7' | 'FD6' | null {
+  const v = typeof explicit === 'string' ? explicit.trim().toLowerCase() : 'auto';
+  if (v === 'food') return 'FD6';
+  if (v === 'cafe') return 'CE7';
+  return inferCategory(keywords);
+}
+
 // 장소/주소 문자열 → 좌표 (키워드 검색 첫 결과)
 async function geocode(query: string): Promise<{ lat: number; lng: number } | null> {
   const docs = await kakaoGet('/search/keyword.json', { query, size: 1 });
@@ -204,6 +261,12 @@ function createServer(): Server {
               type: 'number',
               description: '검색 반경 단위 미터 (기본값: 1000)',
               default: 1000
+            },
+            category: {
+              type: 'string',
+              enum: ['auto', 'food', 'cafe'],
+              description: "업종 필터. 'food'=음식점(FD6), 'cafe'=카페(CE7), 'auto'=키워드로 자동 추론(기본). 카페/식당이 명확하면 지정해 정확도를 높이세요.",
+              default: 'auto'
             }
           },
           required: ['lat', 'lng', 'keywords']
@@ -272,16 +335,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === 'search_kakao_places') {
     const lat = toCoord(args?.lat);
     const lng = toCoord(args?.lng);
-    const keywords = normalizeStringArray(args?.keywords);
+    const rawKeywords = normalizeStringArray(args?.keywords);
     const radius = toCoord(args?.radius) ?? 1000;
 
     if (lat === null || lng === null) {
       throw new Error('lat, lng 유효 좌표 필수. calculate_optimal_midpoint의 center_lat/center_lng 값을 그대로 넣으세요.');
     }
-    if (keywords.length === 0) {
+    if (rawKeywords.length === 0) {
       throw new Error('keywords 배열 필수. (예: ["카페","조용한"])');
     }
-    console.log(`카카오 장소 검색 요청. 좌표: (${lat}, ${lng}), 키워드:`, keywords, `반경: ${radius}m`);
+
+    // 무드어 동의/연관 확장 → 매칭률↑. 카테고리는 명시값 우선, 없으면 키워드로 추론.
+    const keywords = expandKeywords(rawKeywords);
+    const categoryCode = resolveCategory(args?.category, rawKeywords);
+    console.log(
+      `카카오 장소 검색 요청. 좌표: (${lat}, ${lng}), 원키워드:`, rawKeywords,
+      `확장:`, keywords, `반경: ${radius}m`, `카테고리: ${categoryCode ?? '없음'}`
+    );
 
     const safeRadius = Math.min(radius, 20000); // 카카오 최대 20000m
 
@@ -295,16 +365,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const scoreMap = new Map<string, Scored>();
 
     const perKeyword = await Promise.all(
-      keywords.map((kw) =>
-        kakaoGet('/search/keyword.json', {
+      keywords.map((kw) => {
+        const params: Record<string, string | number> = {
           query: kw,
           x: lng,
           y: lat,
           radius: safeRadius,
           sort: 'distance',
           size: 15,
-        }).then((docs) => ({ kw, docs }))
-      )
+        };
+        // 카테고리 추론/지정 시 해당 업종(CE7/FD6)으로 제한해 무관 장소 제거.
+        if (categoryCode) params.category_group_code = categoryCode;
+        return kakaoGet('/search/keyword.json', params).then((docs) => ({ kw, docs }));
+      })
     );
 
     for (const { kw, docs } of perKeyword) {
@@ -341,7 +414,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // 종합 스코어 = 매칭(0.45) + 별점(0.40, 리뷰수로 신뢰 가중) + 근접(0.15)
     const scored = candidates.map((s, i) => {
       const r = ratings[i];
-      const matchNorm = s.matched.size / keywords.length;
+      // 확장어로 매칭 수가 부풀 수 있어 원 키워드 수 기준 + 1.0 상한.
+      const matchNorm = Math.min(s.matched.size / rawKeywords.length, 1);
       const ratingNorm = r?.rating ? r.rating / 5 : 0;
       // 리뷰수 적으면 별점 신뢰 낮춤 (50건에서 포화)
       const confidence = r?.user_rating_count ? Math.min(r.user_rating_count / 50, 1) : 0;
