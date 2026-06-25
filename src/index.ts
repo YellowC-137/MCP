@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -143,23 +143,23 @@ async function fetchGoogleRating(
   }
 }
 
-const app = express();
-app.use(cors());
-
-const server = new Server(
-  {
-    name: 'playmcp-server',
-    version: '1.0.0',
-  },
-  {
-    capabilities: {
-      tools: {},
+// MCP 서버 인스턴스 생성 + 핸들러 등록.
+// Stateless Streamable HTTP라 요청마다 새 인스턴스를 만든다 (분산 환경 세션 무효화 회피).
+function createServer(): Server {
+  const server = new Server(
+    {
+      name: 'playmcp-server',
+      version: '1.0.0',
     },
-  }
-);
+    {
+      capabilities: {
+        tools: {},
+      },
+    }
+  );
 
-// List available tools
-server.setRequestHandler(ListToolsRequestSchema, async () => {
+  // List available tools
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
@@ -370,44 +370,61 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
 
-  throw new Error(`지원하지 않는 도구: ${name}`);
+    throw new Error(`지원하지 않는 도구: ${name}`);
+  });
+
+  return server;
+}
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// MCP Streamable HTTP 엔드포인트 (stateless).
+// 요청마다 새 Server + Transport를 만들어 처리 후 정리 → 세션 미보관, 로드밸런서 뒤에서도 안정.
+app.post('/mcp', async (req, res) => {
+  const server = createServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined, // stateless
+  });
+
+  res.on('close', () => {
+    transport.close();
+    server.close();
+  });
+
+  try {
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error('MCP 요청 처리 오류:', err);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: '2.0',
+        error: { code: -32603, message: '내부 서버 오류' },
+        id: null,
+      });
+    }
+  }
 });
 
-const transports = new Map<string, SSEServerTransport>();
+// stateless 모드에서는 서버 주도 스트림/세션 종료가 불필요 → GET/DELETE는 405.
+const methodNotAllowed = (_req: express.Request, res: express.Response) => {
+  res.status(405).json({
+    jsonrpc: '2.0',
+    error: { code: -32000, message: 'Method Not Allowed. POST /mcp 만 지원 (stateless).' },
+    id: null,
+  });
+};
+app.get('/mcp', methodNotAllowed);
+app.delete('/mcp', methodNotAllowed);
 
-app.get('/sse', async (req, res) => {
-  // SSEServerTransport가 자체 sessionId를 생성하고 endpoint에 붙여 클라이언트로 전달.
-  const transport = new SSEServerTransport('/message', res);
-  const sessionId = transport.sessionId;
-  console.log(`새로운 SSE 세션 생성: ${sessionId}`);
-
-  transports.set(sessionId, transport);
-
-  transport.onclose = () => {
-    console.log(`SSE 세션 종료: ${sessionId}`);
-    transports.delete(sessionId);
-  };
-
-  await server.connect(transport);
-});
-
-app.post('/message', express.json(), async (req, res) => {
-  const sessionId = req.query.sessionId as string;
-  if (!sessionId) {
-    res.status(400).send('sessionId 쿼리 파라미터 필요.');
-    return;
-  }
-
-  const transport = transports.get(sessionId);
-  if (!transport) {
-    res.status(404).send('세션 찾을 수 없음.');
-    return;
-  }
-
-  await transport.handlePostMessage(req, res, req.body);
+// 헬스체크 (클라우드 배포용)
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok' });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`PlayMCP SSE Server listening on port ${PORT}`);
+  console.log(`PlayMCP Streamable HTTP Server listening on port ${PORT} (POST /mcp)`);
 });
