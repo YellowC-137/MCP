@@ -430,7 +430,7 @@ function createServer() {
             tools: [
                 {
                     name: 'calculate_optimal_midpoint',
-                    description: '여러 모임 멤버들의 출발지 목록을 받아서 최적의 중간 대중교통 거점 위치를 계산해 반환합니다. 장소 검색(search_kakao_places) 전에 가장 먼저 호출해 중간 거점을 파악하세요.',
+                    description: '여러 모임 멤버들의 출발지 목록을 받아 최적의 중간 대중교통 거점을 계산해 반환합니다. 거점뿐 아니라 members(참여자별 거점까지 대략 소요시간/거리)와 congestion(서울 주요 지역이면 실시간 혼잡도+시간대 예측)도 함께 반환합니다. 장소 검색(search_kakao_places) 전에 가장 먼저 호출하고, members 소요시간 편차나 congestion을 사용자에게 되묻는 재료로 활용하세요.',
                     inputSchema: {
                         type: 'object',
                         properties: {
@@ -447,7 +447,7 @@ function createServer() {
                 },
                 {
                     name: 'search_kakao_places',
-                    description: '좌표 정보(위도, 경도)와 뾰족해진 취향 키워드를 바탕으로 카카오맵의 장소 목록을 검색해 상위 3곳의 정보를 반환합니다. 호출 전에 사용자에게 추가 조건(주종/룸/예산/분위기 등)을 1~2가지 되물어 키워드를 구체화한 뒤 호출하세요.',
+                    description: '좌표(위도, 경도)와 뾰족해진 취향 키워드로 카카오맵 장소를 검색해 상위 3곳(별점·가격대·거리·카카오맵 링크 포함)을 반환합니다. 호출 전에 사용자에게 추가 조건(주종/룸/예산/분위기/업종/시간 등)을 1~2가지 되물어 키워드를 구체화하세요. 업종이 분명하면 category(food/cafe)를 지정하면 정확도가 올라갑니다.',
                     inputSchema: {
                         type: 'object',
                         properties: {
