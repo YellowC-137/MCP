@@ -16,6 +16,10 @@ const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY;
 const GOOGLE_PLACES_SEARCH = 'https://places.googleapis.com/v1/places:searchText';
 const GOOGLE_TIMEOUT_MS = 3000; // 개별 Google 호출 타임아웃
 
+// 카카오모빌리티 자동차 길찾기. 경로 추천이 아니라 각 멤버→중간지점 대략 거리/시간 표시용.
+const KAKAO_NAVI_DIRECTIONS = 'https://apis-navi.kakaomobility.com/v1/directions';
+const NAVI_TIMEOUT_MS = 3000;
+
 interface KakaoPlace {
   place_name: string;
   address_name: string;
@@ -207,6 +211,263 @@ async function fetchGoogleRating(
   }
 }
 
+// 서울 실시간 도시데이터(인구현황) — 거점 지역 혼잡도 + 12시간 예측. 공식·무료, 서울 주요 ~120곳 한정.
+// 키 없으면 'sample'로 폴백(광화문·덕수궁만 조회 가능). 실서비스는 SEOUL_OPENDATA_KEY 필요.
+const SEOUL_OPENDATA_KEY = process.env.SEOUL_OPENDATA_KEY;
+const SEOUL_CITYDATA_BASE = 'http://openapi.seoul.go.kr:8088';
+const CITYDATA_TIMEOUT_MS = 3000;
+// 중간지점이 핫스폿 대표좌표서 이 반경 밖이면 혼잡도 생략(엉뚱한 지역 혼잡도 방지).
+const HOTSPOT_MATCH_RADIUS_M = 1500;
+
+// 지역혼잡도 API 지원 핫스폿(지역명+대표좌표). 좌표 기반 최근접 매칭용.
+// (서울 실시간 도시데이터 주요 장소 목록)
+const SEOUL_HOTSPOTS: Array<{ name: string; lat: number; lng: number }> = [
+  { name: "DDP(동대문디자인플라자)", lat: 37.566988, lng: 127.010289 },
+  { name: "DMC(디지털미디어시티)", lat: 37.579278, lng: 126.891794 },
+  { name: "가락시장", lat: 37.493468, lng: 127.111896 },
+  { name: "가로수길", lat: 37.521389, lng: 127.023572 },
+  { name: "가산디지털단지역", lat: 37.48089, lng: 126.880107 },
+  { name: "강남 MICE 관광특구", lat: 37.511, lng: 127.060063 },
+  { name: "강남역", lat: 37.498857, lng: 127.028134 },
+  { name: "강서한강공원", lat: 37.586514, lng: 126.818549 },
+  { name: "건대입구역", lat: 37.539967, lng: 127.068195 },
+  { name: "경복궁", lat: 37.579876, lng: 126.976765 },
+  { name: "고덕역", lat: 37.553455, lng: 127.154872 },
+  { name: "고속터미널역", lat: 37.504814, lng: 127.005855 },
+  { name: "고척돔", lat: 37.497672, lng: 126.867023 },
+  { name: "광나루한강공원", lat: 37.553988, lng: 127.12982 },
+  { name: "광장(전통)시장", lat: 37.570003, lng: 126.999904 },
+  { name: "광화문·덕수궁", lat: 37.570931, lng: 126.977186 },
+  { name: "광화문광장", lat: 37.573409, lng: 126.976921 },
+  { name: "교대역", lat: 37.492201, lng: 127.013958 },
+  { name: "구로디지털단지역", lat: 37.483878, lng: 126.896183 },
+  { name: "구로역", lat: 37.50235, lng: 126.882122 },
+  { name: "국립중앙박물관·용산가족공원", lat: 37.522768, lng: 126.981427 },
+  { name: "군자역", lat: 37.556316, lng: 127.080195 },
+  { name: "김포공항", lat: 37.562272, lng: 126.802599 },
+  { name: "난지한강공원", lat: 37.566502, lng: 126.877328 },
+  { name: "남대문시장", lat: 37.559915, lng: 126.978527 },
+  { name: "남산공원", lat: 37.551577, lng: 126.993762 },
+  { name: "노들섬", lat: 37.517557, lng: 126.958661 },
+  { name: "노량진", lat: 37.513894, lng: 126.944056 },
+  { name: "대림역", lat: 37.492667, lng: 126.895543 },
+  { name: "덕수궁길·정동길", lat: 37.566351, lng: 126.971785 },
+  { name: "동대문 관광특구", lat: 37.567311, lng: 127.011023 },
+  { name: "동대문역", lat: 37.571481, lng: 127.009654 },
+  { name: "뚝섬역", lat: 37.548291, lng: 127.046137 },
+  { name: "뚝섬한강공원", lat: 37.529184, lng: 127.071515 },
+  { name: "망원한강공원", lat: 37.553281, lng: 126.899268 },
+  { name: "명동 관광특구", lat: 37.564149, lng: 126.981851 },
+  { name: "미아사거리역", lat: 37.612195, lng: 127.030741 },
+  { name: "반포한강공원", lat: 37.509825, lng: 126.994675 },
+  { name: "발산역", lat: 37.559151, lng: 126.839173 },
+  { name: "보라매공원", lat: 37.492963, lng: 126.920056 },
+  { name: "보신각", lat: 37.570585, lng: 126.983411 },
+  { name: "북서울꿈의숲", lat: 37.621852, lng: 127.041116 },
+  { name: "북창동 먹자골목", lat: 37.562264, lng: 126.978498 },
+  { name: "북촌한옥마을", lat: 37.582236, lng: 126.984002 },
+  { name: "사당역", lat: 37.477931, lng: 126.981266 },
+  { name: "삼각지역", lat: 37.535341, lng: 126.973884 },
+  { name: "서대문독립공원", lat: 37.574091, lng: 126.956607 },
+  { name: "서리풀공원·몽마르뜨공원", lat: 37.491583, lng: 127.002683 },
+  { name: "서울 암사동 유적", lat: 37.560632, lng: 127.130759 },
+  { name: "서울대공원", lat: 37.429007, lng: 127.017156 },
+  { name: "서울대입구역", lat: 37.480613, lng: 126.953063 },
+  { name: "서울숲공원", lat: 37.542963, lng: 127.037648 },
+  { name: "서울식물원·마곡나루역", lat: 37.567597, lng: 126.831061 },
+  { name: "서울역", lat: 37.556594, lng: 126.973028 },
+  { name: "서촌", lat: 37.580367, lng: 126.969575 },
+  { name: "선릉역", lat: 37.506054, lng: 127.049807 },
+  { name: "성수카페거리", lat: 37.542967, lng: 127.056596 },
+  { name: "성신여대입구역", lat: 37.592393, lng: 127.016865 },
+  { name: "송리단길·호수단길", lat: 37.508047, lng: 127.106314 },
+  { name: "송현녹지광장", lat: 37.577857, lng: 126.983711 },
+  { name: "수유역", lat: 37.64106, lng: 127.025722 },
+  { name: "숭례문", lat: 37.560486, lng: 126.975729 },
+  { name: "시의회 앞", lat: 37.567069, lng: 126.976939 },
+  { name: "신논현역·논현역", lat: 37.50808, lng: 127.023406 },
+  { name: "신도림역", lat: 37.509099, lng: 126.890205 },
+  { name: "신림역", lat: 37.484677, lng: 126.929337 },
+  { name: "신정네거리역", lat: 37.521306, lng: 126.855275 },
+  { name: "신촌 스타광장", lat: 37.556509, lng: 126.936931 },
+  { name: "신촌·이대역", lat: 37.557035, lng: 126.938972 },
+  { name: "쌍문역", lat: 37.647762, lng: 127.033089 },
+  { name: "아차산", lat: 37.566842, lng: 127.102811 },
+  { name: "안양천", lat: 37.518668, lng: 126.879697 },
+  { name: "압구정로데오거리", lat: 37.525495, lng: 127.038734 },
+  { name: "양재역", lat: 37.485339, lng: 127.033972 },
+  { name: "양화한강공원", lat: 37.541305, lng: 126.898185 },
+  { name: "어린이대공원", lat: 37.549062, lng: 127.081361 },
+  { name: "여의도", lat: 37.525022, lng: 126.925531 },
+  { name: "여의도한강공원", lat: 37.528987, lng: 126.928223 },
+  { name: "여의서로", lat: 37.532701, lng: 126.914584 },
+  { name: "역삼역", lat: 37.500392, lng: 127.038184 },
+  { name: "연남동", lat: 37.561618, lng: 126.92234 },
+  { name: "연신내역", lat: 37.618659, lng: 126.920725 },
+  { name: "영등포 타임스퀘어", lat: 37.516863, lng: 126.906151 },
+  { name: "오목교역·목동운동장", lat: 37.528811, lng: 126.876641 },
+  { name: "올림픽공원", lat: 37.519408, lng: 127.122411 },
+  { name: "왕십리역", lat: 37.562216, lng: 127.0389 },
+  { name: "용리단길", lat: 37.531186, lng: 126.971294 },
+  { name: "용산역", lat: 37.530256, lng: 126.960822 },
+  { name: "월드컵공원", lat: 37.570188, lng: 126.884201 },
+  { name: "응봉산", lat: 37.548215, lng: 127.030466 },
+  { name: "이촌한강공원", lat: 37.519401, lng: 126.966651 },
+  { name: "이태원 관광특구", lat: 37.534438, lng: 126.994373 },
+  { name: "이태원 앤틱가구거리", lat: 37.532231, lng: 126.993918 },
+  { name: "이태원역", lat: 37.534186, lng: 126.993048 },
+  { name: "익선동", lat: 37.572661, lng: 126.989631 },
+  { name: "인사동", lat: 37.573863, lng: 126.986063 },
+  { name: "잠실 관광특구", lat: 37.516479, lng: 127.115274 },
+  { name: "잠실롯데타워·석촌호수", lat: 37.511559, lng: 127.103306 },
+  { name: "잠실새내역", lat: 37.510413, lng: 127.082656 },
+  { name: "잠실역", lat: 37.511997, lng: 127.100367 },
+  { name: "잠실종합운동장", lat: 37.514522, lng: 127.073648 },
+  { name: "잠실한강공원", lat: 37.519234, lng: 127.084298 },
+  { name: "잠원한강공원", lat: 37.52381, lng: 127.014728 },
+  { name: "장지역", lat: 37.47875, lng: 127.123275 },
+  { name: "장한평역", lat: 37.561804, lng: 127.064786 },
+  { name: "종로·청계 관광특구", lat: 37.570002, lng: 126.99737 },
+  { name: "창덕궁·종묘", lat: 37.578696, lng: 126.993353 },
+  { name: "창동 신경제 중심지", lat: 37.656148, lng: 127.054706 },
+  { name: "천호역", lat: 37.539239, lng: 127.125013 },
+  { name: "청계산", lat: 37.440739, lng: 127.050018 },
+  { name: "청담동 명품거리", lat: 37.525832, lng: 127.043765 },
+  { name: "청량리 제기동 일대 전통시장", lat: 37.58083, lng: 127.039981 },
+  { name: "총신대입구(이수)역", lat: 37.486003, lng: 126.981042 },
+  { name: "충정로역", lat: 37.559696, lng: 126.963691 },
+  { name: "합정역", lat: 37.549376, lng: 126.911735 },
+  { name: "해방촌·경리단길", lat: 37.542371, lng: 126.987183 },
+  { name: "혜화역", lat: 37.582482, lng: 127.001764 },
+  { name: "홍대 관광특구", lat: 37.553919, lng: 126.921274 },
+  { name: "홍대입구역(2호선)", lat: 37.556762, lng: 126.923008 },
+  { name: "홍제폭포", lat: 37.580788, lng: 126.936983 },
+  { name: "회기역", lat: 37.59054, lng: 127.056162 },
+];
+
+// 두 좌표 간 거리(m), Haversine.
+function haversineM(aLat: number, aLng: number, bLat: number, bLng: number): number {
+  const R = 6371000;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(bLat - aLat);
+  const dLng = toRad(bLng - aLng);
+  const s =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+// 좌표 → 가장 가까운 핫스폿 지역명 (반경 내). 없으면 null.
+function matchHotspot(lat: number, lng: number): string | null {
+  let best: { name: string; dist: number } | null = null;
+  for (const h of SEOUL_HOTSPOTS) {
+    const d = haversineM(lat, lng, h.lat, h.lng);
+    if (!best || d < best.dist) best = { name: h.name, dist: d };
+  }
+  if (best && best.dist <= HOTSPOT_MATCH_RADIUS_M) return best.name;
+  return null;
+}
+
+interface Congestion {
+  area_name: string;
+  level: string; // 여유/보통/약간 붐빔/붐빔
+  message: string;
+  ppltn_min: number | null;
+  ppltn_max: number | null;
+  updated: string;
+  forecast: Array<{ time: string; level: string }>; // 시간대별 예측(혼잡 몰리는 시간 파악용)
+}
+
+// 지역명으로 실시간 혼잡도 + 예측 조회. 실패/미지원 지역이면 null 폴백.
+async function fetchAreaCongestion(areaNm: string): Promise<Congestion | null> {
+  const key = SEOUL_OPENDATA_KEY || 'sample';
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CITYDATA_TIMEOUT_MS);
+  try {
+    const url = `${SEOUL_CITYDATA_BASE}/${key}/json/citydata_ppltn/1/1/${encodeURIComponent(areaNm)}`;
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      'SeoulRtd.citydata_ppltn'?: Array<{
+        AREA_NM: string;
+        AREA_CONGEST_LVL: string;
+        AREA_CONGEST_MSG: string;
+        AREA_PPLTN_MIN?: string;
+        AREA_PPLTN_MAX?: string;
+        PPLTN_TIME: string;
+        FCST_PPLTN?: Array<{ FCST_TIME: string; FCST_CONGEST_LVL: string }>;
+      }>;
+      RESULT?: { 'RESULT.CODE'?: string };
+    };
+    const row = data['SeoulRtd.citydata_ppltn']?.[0];
+    if (!row || !row.AREA_CONGEST_LVL) return null;
+    // 요청 지역과 응답 지역이 다르면(sample키 치환 등) 엉뚱한 지역 혼잡도이므로 버림.
+    if (row.AREA_NM !== areaNm) return null;
+    return {
+      area_name: row.AREA_NM,
+      level: row.AREA_CONGEST_LVL,
+      message: row.AREA_CONGEST_MSG,
+      ppltn_min: row.AREA_PPLTN_MIN ? parseInt(row.AREA_PPLTN_MIN, 10) : null,
+      ppltn_max: row.AREA_PPLTN_MAX ? parseInt(row.AREA_PPLTN_MAX, 10) : null,
+      updated: row.PPLTN_TIME,
+      forecast: (row.FCST_PPLTN ?? []).map((f) => ({
+        time: f.FCST_TIME.slice(11, 16), // "HH:MM"
+        level: f.FCST_CONGEST_LVL,
+      })),
+    };
+  } catch (e) {
+    console.error('서울 혼잡도 호출 실패:', e);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+interface DriveETA {
+  distance_m: number;
+  duration_min: number;
+}
+
+// 출발 좌표 → 도착 좌표 자동차 소요시간/거리 (요약값만). 실패 시 null 폴백(안정성).
+// 카카오 디벨로퍼스에서 '카카오내비/길찾기' 활성화 필요. 미활성/오류면 null → 호출부가 ETA 없이 진행.
+async function fetchDriveETA(
+  origin: { lat: number; lng: number },
+  dest: { lat: number; lng: number }
+): Promise<DriveETA | null> {
+  if (!KAKAO_REST_API_KEY) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), NAVI_TIMEOUT_MS);
+  try {
+    const url = new URL(KAKAO_NAVI_DIRECTIONS);
+    // 좌표 포맷은 "경도,위도" (x,y)
+    url.searchParams.set('origin', `${origin.lng},${origin.lat}`);
+    url.searchParams.set('destination', `${dest.lng},${dest.lat}`);
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { Authorization: `KakaoAK ${KAKAO_REST_API_KEY}` },
+    });
+    if (!res.ok) {
+      console.error(`카카오모빌리티 오류 ${res.status}: ${await res.text()}`);
+      return null;
+    }
+    const data = (await res.json()) as {
+      routes?: Array<{ result_code: number; summary?: { distance: number; duration: number } }>;
+    };
+    const route = data.routes?.[0];
+    // result_code 0 = 성공. 그 외(출발=도착 등)는 ETA 생략.
+    if (!route || route.result_code !== 0 || !route.summary) return null;
+    return {
+      distance_m: route.summary.distance,
+      duration_min: Math.round(route.summary.duration / 60),
+    };
+  } catch (e) {
+    console.error('카카오모빌리티 호출 실패:', e);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // MCP 서버 인스턴스 생성 + 핸들러 등록.
 // Stateless Streamable HTTP라 요청마다 새 인스턴스를 만든다 (분산 환경 세션 무효화 회피).
 function createServer(): Server {
@@ -294,16 +555,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     console.log(`중간 지점 계산 요청. 입력 출발지:`, locations);
 
-    // 1. 각 출발지 좌표 변환
-    const coords = await Promise.all(locations.map(geocode));
-    const valid = coords.filter((c): c is { lat: number; lng: number } => c !== null);
+    // 1. 각 출발지 좌표 변환 (출발지명 ↔ 좌표 쌍 유지: 멤버별 소요시간 표시에 사용)
+    const geocoded = await Promise.all(
+      locations.map(async (loc) => ({ loc, coord: await geocode(loc) }))
+    );
+    const valid = geocoded.filter(
+      (g): g is { loc: string; coord: { lat: number; lng: number } } => g.coord !== null
+    );
     if (valid.length === 0) {
       throw new Error('좌표 변환 실패. 출발지명 확인 필요.');
     }
 
     // 2. centroid (좌표 평균)
-    const centLat = valid.reduce((s, c) => s + c.lat, 0) / valid.length;
-    const centLng = valid.reduce((s, c) => s + c.lng, 0) / valid.length;
+    const centLat = valid.reduce((s, g) => s + g.coord.lat, 0) / valid.length;
+    const centLng = valid.reduce((s, g) => s + g.coord.lng, 0) / valid.length;
 
     // 3. centroid 근처 지하철역(SW8) 검색 → 대중교통 거점으로 스냅
     const stations = await kakaoGet('/search/category.json', {
@@ -315,10 +580,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       size: 1,
     });
 
-    let result;
+    let center: { center_region: string; center_lat: number; center_lng: number; snapped_to_station: boolean };
     if (stations.length > 0) {
       const st = stations[0];
-      result = {
+      center = {
         center_region: st.place_name,
         center_lat: parseFloat(st.y),
         center_lng: parseFloat(st.x),
@@ -326,13 +591,35 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     } else {
       // 근처 역 없으면 centroid 그대로 반환
-      result = {
+      center = {
         center_region: '중간 지점',
         center_lat: centLat,
         center_lng: centLng,
         snapped_to_station: false,
       };
     }
+
+    // 4. 멤버별 중간지점까지 대략 소요시간/거리 (자동차 기준, 시각화·투명성용).
+    //    경로 추천이 아니라 "각자 얼마나 걸리는지" 비교용. 실패 멤버는 null.
+    const destCoord = { lat: center.center_lat, lng: center.center_lng };
+    const settled = await Promise.allSettled(
+      valid.map((g) => fetchDriveETA(g.coord, destCoord))
+    );
+    const members = valid.map((g, i) => {
+      const r = settled[i];
+      const eta = r.status === 'fulfilled' ? r.value : null;
+      return {
+        location: g.loc,
+        distance_m: eta?.distance_m ?? null,
+        duration_min: eta?.duration_min ?? null,
+      };
+    });
+
+    // 5. 거점 지역 혼잡도 (서울 핫스폿 매칭 시). 비매칭/비서울/실패는 null.
+    const hotspot = matchHotspot(center.center_lat, center.center_lng);
+    const congestion = hotspot ? await fetchAreaCongestion(hotspot) : null;
+
+    const result = { ...center, members, congestion };
 
     return {
       content: [{ type: 'text', text: JSON.stringify(result) }],
